@@ -170,6 +170,58 @@ public sealed class IntegrationOutboxPublisher : IExternalServiceClient
             cancellationToken);
     }
 
+    public async Task RecordRecommendationImpressionsAsync(
+        long userId,
+        IReadOnlyList<RecommendationImpressionEventItem> items,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(userId, 0);
+        ArgumentNullException.ThrowIfNull(items);
+        if (items.Count is < 1 or > 50)
+        {
+            throw new ArgumentOutOfRangeException(nameof(items), "An impression batch must contain between 1 and 50 items.");
+        }
+
+        var normalized = items.ToArray();
+        if (normalized.Length == 0 ||
+            normalized.Select(item => item.IdempotencyKey).Distinct(StringComparer.Ordinal).Count() != normalized.Length ||
+            normalized.Any(item =>
+                item.TargetId <= 0 ||
+                string.IsNullOrWhiteSpace(item.IdempotencyKey) ||
+                item.IdempotencyKey.Length > 128 ||
+                item.IdempotencyKey.Any(character =>
+                    !char.IsAsciiLetterOrDigit(character) && character is not ('-' or '_' or '.' or ':')) ||
+                item.DwellMs is < 0 or > 900_000 ||
+                item.CompletionPct is { } completion &&
+                    (!double.IsFinite(completion) || completion is < 0 or > 100)))
+        {
+            throw new ArgumentException("The impression batch contains an invalid item.", nameof(items));
+        }
+
+        var observedAt = await _outbox.GetCurrentTimeAsync(cancellationToken);
+        var bucket = observedAt.ToUnixTimeSeconds() / 300;
+        normalized = normalized
+            .OrderBy(item => item.TargetId)
+            .Select(item => item with
+            {
+                // The browser key is validated above, but storage idempotency is server-owned:
+                // at most one impression per trusted viewer/target/five-minute window.
+                IdempotencyKey = "socialgraph-" + Convert.ToHexString(SHA256.HashData(
+                    Encoding.UTF8.GetBytes($"recommendation-impression:v2:{userId}:{item.TargetId}:{bucket}")))
+                    .ToLowerInvariant()
+            })
+            .ToArray();
+        await EnqueueAsync(
+            IntegrationEventType.RecommendationImpressions,
+            userId,
+            new RecommendationImpressionEvent(userId, observedAt, normalized),
+            cancellationToken,
+            operationId: $"recommendation-impressions:v2:{userId}:{bucket}",
+            idempotencyMaterial: JsonSerializer.Serialize(
+                normalized.Select(item => item.IdempotencyKey).ToArray(),
+                JsonOptions));
+    }
+
     public Task CreateMessengerUserAsync(long userId, CancellationToken cancellationToken = default)
     {
         return EnqueueAsync(

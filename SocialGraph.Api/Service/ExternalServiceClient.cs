@@ -276,6 +276,48 @@ public sealed class ExternalServiceClient : IExternalServiceTransport
                     EnsureMediaFinalizeCompleted(legacyUrls, responseBody);
                     break;
                 }
+            case IntegrationEventType.RecommendationImpressions:
+                {
+                    var payload = Deserialize<RecommendationImpressionEvent>(message.payload);
+                    if (payload.UserId <= 0 ||
+                        payload.ObservedAt == default ||
+                        payload.Items is null ||
+                        payload.Items.Count is < 1 or > 50 ||
+                        payload.Items.Select(item => item.TargetId).Distinct().Count() != payload.Items.Count ||
+                        payload.Items.Any(item =>
+                            item.TargetId <= 0 ||
+                            string.IsNullOrWhiteSpace(item.IdempotencyKey) ||
+                            item.IdempotencyKey.Length > 128 ||
+                            item.DwellMs is < 0 or > 900_000 ||
+                            item.CompletionPct is { } completion &&
+                                (!double.IsFinite(completion) || completion is < 0 or > 100)))
+                    {
+                        throw new PermanentOutboxException("Recommendation impression event is invalid.");
+                    }
+
+                    await SendOutboxRequiredAsync(
+                        "RecommendationServiceRecordImpressions",
+                        HttpMethod.Post,
+                        GetInternalServiceUrl(
+                            "Recommendation",
+                            $"internal/recommendation/users/{FormatId(payload.UserId)}/impressions"),
+                        new
+                        {
+                            occurredAt = payload.ObservedAt,
+                            items = payload.Items.Select(item => new
+                            {
+                                targetId = item.TargetId,
+                                idempotencyKey = item.IdempotencyKey,
+                                dwellMs = item.DwellMs ?? 0,
+                                completionPct = item.CompletionPct ?? 0d
+                            })
+                        },
+                        RecommendationSecretHeader,
+                        "InternalServices:Recommendation:SharedSecret",
+                        message.idempotency_key,
+                        cancellationToken);
+                    break;
+                }
             case IntegrationEventType.MediaDelete:
                 {
                     var payload = Deserialize<MediaLifecycleEvent>(message.payload);

@@ -287,6 +287,8 @@ Current internal endpoints:
 
 ```text
 GET /internal/recommendation/post-candidate-ids
+GET /internal/recommendation/content-candidates
+GET /internal/recommendation/post-candidates (compatibility alias)
 GET /internal/recommendation/reel-candidates
 POST /internal/messaging/permissions/check
 GET /internal/users/{userId}/friend-ids
@@ -296,6 +298,36 @@ DELETE /internal/stories/expired?limit=100
 GET /internal/outbox/dead-letters?limit=50
 POST /internal/outbox/{eventId}/retry
 ```
+
+`content-candidates` is a bounded, signed internal Recommendation projection. It returns only
+metadata (`id`, `authorId`, `createdAt`, `contentType`, optional `groupId`, and a coarse `source`)
+for IDs that have already passed SocialGraph privacy, membership and two-way block filtering. It
+never returns content or media URLs; Recommendation must hydrate through the viewer-aware Fusion
+projection before rendering. The older ID-only endpoint remains during rolling deployment.
+The candidate pool is merged with a deterministic source-balanced schedule before its 500-item
+cap: 10% self, 20% friends, 20% follows, 20% joined groups, 20% public feed and 10% public groups.
+Empty sources donate their slots and therefore never shorten a page. Self-authored FeedPost/Reel
+objects may use any valid privacy value; self-authored GroupPost objects still pass the normal
+group membership/public-group policy and never bypass it. Relationship authors are selected with
+one indexed, per-author-bounded lateral query, privacy is applied before the accepted quota, and each source
+is round-robin ordered by author so prolific authors cannot monopolize the candidate window.
+Public feed/Reel/group discovery first filters public privacy and two-way blocks inside a bounded
+recent window, prioritizes a per-author slice, then uses remaining rows only to fill empty capacity;
+therefore invalid bursts cannot starve older visible rows inside that window and sparse sources
+still fill the page.
+`reel-candidates` accepts `mode=FOR_YOU|FOLLOWING`: FOR_YOU uses a 10% self, 30% friend, 30%
+follow and 30% public schedule, while FOLLOWING fills exclusively from friend/follow queues before
+the final cap. The default remains FOR_YOU for rolling compatibility.
+
+The additive `recordRecommendationImpressions(input)` mutation accepts at most 50 unique visible
+post/Reel IDs per request. `targetId` is GraphQL `ID!` and must be sent as a decimal string, so a
+Snowflake above JavaScript's safe-integer boundary is never rounded. The actor comes from the
+trusted Gateway caller; browser input contains only bounded opaque retry keys and optional bounded
+dwell/completion hints. SocialGraph rechecks visibility in one batch and silently drops unavailable
+IDs, then queues a signed `recommendation.impressions.v1` outbox event. Its observation time comes
+from the database clock and is retained across outbox retries. Storage idempotency is server-owned:
+at most one impression per trusted viewer, target and five-minute UTC bucket. No impression is
+accepted as evidence of access to a private, deleted or blocked object.
 
 Operational probes are public to the container/orchestrator: `GET /health/live` always reports process liveness; `GET /health/ready` requires PostgreSQL and reports Redis as either `available` or `postgres-fallback` without failing readiness.
 

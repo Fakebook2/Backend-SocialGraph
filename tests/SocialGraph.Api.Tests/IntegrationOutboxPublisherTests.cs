@@ -97,6 +97,47 @@ public sealed class IntegrationOutboxPublisherTests
     }
 
     [Fact]
+    public async Task RecommendationImpressions_QueuesBoundedScopedBatch()
+    {
+        await using var dbContext = CreateDbContext();
+        var store = new PostgresIntegrationOutboxStore(
+            dbContext,
+            Options.Create(new IntegrationOutboxOptions()));
+        var publisher = new IntegrationOutboxPublisher(
+            store,
+            new HttpContextAccessor { HttpContext = new DefaultHttpContext() },
+            new OutboxPayloadProtector(Configuration()));
+
+        await publisher.RecordRecommendationImpressionsAsync(
+            123,
+            [
+                new RecommendationImpressionEventItem(456, "viewer-scoped-key", 1_000, 50)
+            ]);
+
+        var message = Assert.Single(await dbContext.IntegrationOutboxTb.ToListAsync());
+        Assert.Equal(IntegrationEventType.RecommendationImpressions, message.event_type);
+        var payload = JsonSerializer.Deserialize<RecommendationImpressionEvent>(
+            message.payload,
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+        Assert.NotNull(payload);
+        Assert.Equal(123, payload.UserId);
+        Assert.InRange(payload.ObservedAt, DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddMinutes(1));
+        var item = Assert.Single(payload.Items);
+        Assert.Equal(456, item.TargetId);
+        Assert.StartsWith("socialgraph-", item.IdempotencyKey, StringComparison.Ordinal);
+        Assert.NotEqual("viewer-scoped-key", item.IdempotencyKey);
+        Assert.Equal(1_000, item.DwellMs);
+        Assert.Equal(50, item.CompletionPct);
+
+        // A different browser key in the same server-owned window cannot create a second
+        // stored impression for the same viewer/target.
+        await publisher.RecordRecommendationImpressionsAsync(
+            123,
+            [new RecommendationImpressionEventItem(456, "another-browser-key", 2_000, 75)]);
+        Assert.Single(await dbContext.IntegrationOutboxTb.ToListAsync());
+    }
+
+    [Fact]
     public async Task MediaLifecycle_DeduplicatesWithinBatchButKeepsLaterSameSlotReattach()
     {
         await using var dbContext = CreateDbContext();

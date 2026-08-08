@@ -24,6 +24,50 @@ public sealed class InternalControllerInputTests
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]
+    public async Task RecommendationMetadataEndpoint_RejectsNonPositiveUserIds(long userId)
+    {
+        var controller = new RecommendationController(Mock.Of<ICandidateService>());
+
+        var result = await controller.GetContentCandidatesAsync(userId);
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("POPULAR")]
+    public async Task ReelCandidates_RejectUnsupportedModeBeforeServiceDispatch(string mode)
+    {
+        var service = new Mock<ICandidateService>(MockBehavior.Strict);
+        var controller = new RecommendationController(service.Object);
+
+        var result = await controller.GetReelCandidatesAsync(100, mode: mode);
+
+        Assert.IsType<BadRequestObjectResult>(result.Result);
+        service.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task ReelCandidates_NormalizesAndForwardsFollowingMode()
+    {
+        var service = new Mock<ICandidateService>(MockBehavior.Strict);
+        service.Setup(item => item.GetReelCandidatesAsync(
+                100,
+                25,
+                "FOLLOWING",
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Array.Empty<SocialGraph.Api.Contracts.CandidateItemResult>());
+        var controller = new RecommendationController(service.Object);
+
+        var result = await controller.GetReelCandidatesAsync(100, 25, " following ");
+
+        Assert.IsType<OkObjectResult>(result.Result);
+        service.VerifyAll();
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
     public async Task PaymentEndpoint_RejectsNonPositiveUserIds(long userId)
     {
         var controller = new PaymentController(Mock.Of<IUserGraphService>());

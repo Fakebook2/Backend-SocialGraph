@@ -29,8 +29,9 @@ public sealed class RecommendationController : ControllerBase
         return Ok(await _candidateService.GetPostCandidateIdsAsync(userId, limit, cancellationToken));
     }
 
-    [HttpGet("reel-candidates")]
-    public async Task<ActionResult<IReadOnlyList<CandidateItemResult>>> GetReelCandidatesAsync(
+    [HttpGet("content-candidates")]
+    [HttpGet("post-candidates")]
+    public async Task<ActionResult<IReadOnlyList<RecommendationCandidateResult>>> GetContentCandidatesAsync(
         [FromQuery] long userId,
         [FromQuery] int limit = 200,
         CancellationToken cancellationToken = default)
@@ -40,6 +41,27 @@ public sealed class RecommendationController : ControllerBase
             return BadRequest(new { error = new { code = "BAD_REQUEST", message = "userId must be positive." } });
         }
 
-        return Ok(await _candidateService.GetReelCandidatesAsync(userId, limit, cancellationToken));
+        return Ok(await _candidateService.GetPostCandidatesAsync(userId, limit, cancellationToken));
+    }
+
+    [HttpGet("reel-candidates")]
+    public async Task<ActionResult<IReadOnlyList<CandidateItemResult>>> GetReelCandidatesAsync(
+        [FromQuery] long userId,
+        [FromQuery] int limit = 200,
+        [FromQuery] string mode = "FOR_YOU",
+        CancellationToken cancellationToken = default)
+    {
+        if (userId <= 0)
+        {
+            return BadRequest(new { error = new { code = "BAD_REQUEST", message = "userId must be positive." } });
+        }
+
+        var normalizedMode = mode.Trim().ToUpperInvariant();
+        if (normalizedMode is not ("FOR_YOU" or "FOLLOWING"))
+        {
+            return BadRequest(new { error = new { code = "BAD_REQUEST", message = "mode must be FOR_YOU or FOLLOWING." } });
+        }
+
+        return Ok(await _candidateService.GetReelCandidatesAsync(userId, limit, normalizedMode, cancellationToken));
     }
 }

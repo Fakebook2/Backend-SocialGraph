@@ -15,6 +15,7 @@ public static class IntegrationEventType
     public const string RecommendationContentUpsert = "recommendation.content-upsert.v1";
     public const string RecommendationContentDelete = "recommendation.content-delete.v1";
     public const string RecommendationInteraction = "recommendation.interaction.v1";
+    public const string RecommendationImpressions = "recommendation.impressions.v1";
     public const string MessagingUserCreate = "messaging.user-create.v1";
     public const string MessagingUserDelete = "messaging.user-delete.v1";
     public const string MediaFinalize = "media.finalize.v1";
@@ -73,6 +74,17 @@ public sealed record ContentEmbeddingEvent(long ContentId, string Content, IRead
 public sealed record ContentProjectionDeleteEvent(long ContentId);
 
 public sealed record RecommendationInteractionEvent(long UserId, long TargetId, string Action);
+
+public sealed record RecommendationImpressionEvent(
+    long UserId,
+    DateTimeOffset ObservedAt,
+    IReadOnlyList<RecommendationImpressionEventItem> Items);
+
+public sealed record RecommendationImpressionEventItem(
+    long TargetId,
+    string IdempotencyKey,
+    int? DwellMs = null,
+    double? CompletionPct = null);
 
 public sealed record MessagingUserEvent(long UserId);
 

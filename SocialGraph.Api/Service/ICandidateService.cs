@@ -5,5 +5,7 @@ using SocialGraph.Api.Contracts;
 public interface ICandidateService
 {
     Task<IReadOnlyList<long>> GetPostCandidateIdsAsync(long userId, int limit, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<RecommendationCandidateResult>> GetPostCandidatesAsync(long userId, int limit, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<CandidateItemResult>> GetReelCandidatesAsync(long userId, int limit, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<CandidateItemResult>> GetReelCandidatesAsync(long userId, int limit, string mode, CancellationToken cancellationToken = default);
 }

@@ -1,12 +1,18 @@
 ﻿namespace SocialGraph.Api.SubGraphQL;
 
+using System.Globalization;
 using HotChocolate;
 using SocialGraph.Api.Contracts;
 using SocialGraph.Api.Infrastructure;
+using SocialGraph.Api.Infrastructure.Outbox;
 using SocialGraph.Api.Service;
 
 public class Mutation
 {
+    private const int MaxRecommendationImpressions = 50;
+    private const int MaxImpressionIdempotencyKeyLength = 128;
+    private const int MaxImpressionDwellMilliseconds = 900_000;
+
     public Task<CreateUserPayload> CreateUserAsync(
         CreateUserInput input,
         [Service] IUserGraphService userGraphService,
@@ -469,6 +475,70 @@ public class Mutation
         return await contentGraphService.WatchAsync(userId, targetId, cancellationToken);
     }
 
+    public async Task<OperationResult> RecordRecommendationImpressionsAsync(
+        RecommendationImpressionInput input,
+        [Service] IContentGraphService contentGraphService,
+        [Service] IExternalServiceClient externalServiceClient,
+        [Service] ITrustedCallerAccessor trustedCaller,
+        CancellationToken cancellationToken)
+    {
+        var viewerId = trustedCaller.RequireUserId();
+        if (input?.Items is null || input.Items.Count is < 1 or > MaxRecommendationImpressions)
+        {
+            throw BadUserInput($"An impression batch must contain between 1 and {MaxRecommendationImpressions} items.");
+        }
+
+        var normalized = new List<RecommendationImpressionEventItem>(input.Items.Count);
+        var targetIds = new HashSet<long>();
+        var idempotencyKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in input.Items)
+        {
+            if (item is null ||
+                item.TargetId is null ||
+                item.TargetId.Length is < 1 or > 19 ||
+                item.TargetId.Any(character => character is < '0' or > '9') ||
+                !long.TryParse(item.TargetId, NumberStyles.None, CultureInfo.InvariantCulture, out var targetId) ||
+                targetId <= 0 ||
+                !targetIds.Add(targetId))
+            {
+                throw BadUserInput("An impression batch contains an invalid or duplicate target.");
+            }
+
+            var clientKey = NormalizeImpressionIdempotencyKey(item.IdempotencyKey);
+            if (!idempotencyKeys.Add(clientKey) ||
+                item.DwellMs is < 0 or > MaxImpressionDwellMilliseconds ||
+                item.CompletionPct is { } completion && (!double.IsFinite(completion) || completion is < 0 or > 100))
+            {
+                throw BadUserInput("An impression batch contains invalid metrics or duplicate idempotency keys.");
+            }
+
+            normalized.Add(new RecommendationImpressionEventItem(
+                targetId,
+                clientKey,
+                item.DwellMs,
+                item.CompletionPct));
+        }
+
+        // Use the same batched viewer-aware hydrator as Home. It rechecks current privacy,
+        // group membership and both block directions. Unavailable IDs are silently omitted so
+        // this mutation cannot become an existence/privacy oracle.
+        var visiblePosts = await contentGraphService.GetPostDetailsAsync(
+            viewerId,
+            normalized.Select(item => item.TargetId).ToArray(),
+            cancellationToken);
+        var visibleIds = visiblePosts.Select(HomePostId).ToHashSet();
+        var accepted = normalized.Where(item => visibleIds.Contains(item.TargetId)).ToArray();
+        if (accepted.Length > 0)
+        {
+            await externalServiceClient.RecordRecommendationImpressionsAsync(
+                viewerId,
+                accepted,
+                cancellationToken);
+        }
+
+        return new OperationResult(true);
+    }
+
     public async Task<bool> TagAsync(long postId, long userId, [Service] IContentGraphService contentGraphService, [Service] ISocialReadModelService readModels, [Service] ITrustedCallerAccessor trustedCaller, CancellationToken cancellationToken)
     {
         var viewerId = trustedCaller.RequireUserId();
@@ -536,6 +606,41 @@ public class Mutation
         return new GraphQLException(
             ErrorBuilder.New()
                 .SetCode("FORBIDDEN")
+                .SetMessage(message)
+                .Build());
+    }
+
+    private static long HomePostId(IHomePostResult post) => post switch
+    {
+        FeedPostDetailResult feedPost => feedPost.Id,
+        GroupPostDetailResult groupPost => groupPost.Id,
+        ReelDetailResult reel => reel.Id,
+        _ => 0
+    };
+
+    private static string NormalizeImpressionIdempotencyKey(string? value)
+    {
+        var normalized = InputSecurity.RequiredText(
+            value,
+            "idempotencyKey",
+            MaxImpressionIdempotencyKeyLength,
+            multiline: false,
+            collapseWhitespace: false,
+            maxCombiningMarks: 0);
+        if (normalized.Any(character =>
+                !char.IsAsciiLetterOrDigit(character) && character is not ('-' or '_' or '.' or ':')))
+        {
+            throw BadUserInput("Impression idempotency keys contain unsupported characters.");
+        }
+
+        return normalized;
+    }
+
+    private static GraphQLException BadUserInput(string message)
+    {
+        return new GraphQLException(
+            ErrorBuilder.New()
+                .SetCode("BAD_USER_INPUT")
                 .SetMessage(message)
                 .Build());
     }

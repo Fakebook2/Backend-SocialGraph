@@ -2,7 +2,6 @@ namespace SocialGraph.Api.Tests;
 
 using System.Text.Json.Nodes;
 using Microsoft.EntityFrameworkCore;
-using Moq;
 using SocialGraph.Api.Database;
 using SocialGraph.Api.Service;
 
@@ -48,11 +47,11 @@ public sealed class CandidateServiceTests
             Edge(302, GraphAssociationType.Published, 1_011),
             Edge(303, GraphAssociationType.Published, 1_012));
         await context.SaveChangesAsync();
-        var service = new CandidateService(context, Mock.Of<IAssociationService>());
+        var service = new CandidateService(context);
 
         var ids = await service.GetPostCandidateIdsAsync(UserId, 20);
 
-        Assert.Equal(new long[] { 1_011, 1_008, 1_007, 1_006, 1_005, 1_003, 1_002, 1_001, 1_000 }, ids);
+        Assert.Equal(new long[] { 1_006, 1_007, 1_003, 1_008, 1_011, 1_000, 1_002, 1_005, 1_001 }, ids);
         Assert.DoesNotContain(1_004, ids);
         Assert.DoesNotContain(1_009, ids);
         Assert.DoesNotContain(1_010, ids);
@@ -74,11 +73,323 @@ public sealed class CandidateServiceTests
             Authored(blockedAuthorId, blockedPostId),
             AuthoredBy(blockedPostId, blockedAuthorId));
         await context.SaveChangesAsync();
-        var service = new CandidateService(context, Mock.Of<IAssociationService>());
+        var service = new CandidateService(context);
 
         var ids = await service.GetPostCandidateIdsAsync(UserId, 20);
 
         Assert.DoesNotContain(blockedPostId, ids);
+    }
+
+    [Fact]
+    public async Task PostCandidateIds_SourceBalancedMerge_PreventsPublicCrowdOut()
+    {
+        await using var context = CreateContext();
+        const long friendId = 200;
+        const long publicAuthorId = 201;
+        const long friendPostId = 1_000;
+        context.ObjectsTb.AddRange(
+            User(friendId),
+            User(publicAuthorId),
+            Post(friendPostId, GraphObjectType.FeedPost, privacy: 2));
+        context.AssociationsTb.AddRange(
+            Edge(UserId, GraphAssociationType.Friend, friendId),
+            Authored(friendId, friendPostId),
+            AuthoredBy(friendPostId, friendId));
+        foreach (var postId in Enumerable.Range(2_000, 80).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(postId, GraphObjectType.FeedPost, privacy: 0));
+            context.AssociationsTb.Add(Authored(publicAuthorId, postId));
+            context.AssociationsTb.Add(AuthoredBy(postId, publicAuthorId));
+        }
+        await context.SaveChangesAsync();
+
+        var service = new CandidateService(context);
+        var ids = await service.GetPostCandidateIdsAsync(UserId, 10);
+
+        Assert.Equal(10, ids.Count);
+        Assert.Contains(friendPostId, ids);
+        Assert.Equal(friendPostId, ids[0]);
+    }
+
+    [Fact]
+    public async Task ReelCandidates_SourceBalancedMerge_PreventsPublicCrowdOut()
+    {
+        await using var context = CreateContext();
+        const long friendId = 200;
+        const long publicAuthorId = 201;
+        const long friendReelId = 1_000;
+        context.ObjectsTb.AddRange(
+            User(friendId),
+            User(publicAuthorId),
+            Post(friendReelId, GraphObjectType.Reel, privacy: 2));
+        context.AssociationsTb.AddRange(
+            Edge(UserId, GraphAssociationType.Friend, friendId),
+            Authored(friendId, friendReelId),
+            AuthoredBy(friendReelId, friendId));
+        foreach (var reelId in Enumerable.Range(2_000, 80).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(reelId, GraphObjectType.Reel, privacy: 0));
+            context.AssociationsTb.Add(Authored(publicAuthorId, reelId));
+            context.AssociationsTb.Add(AuthoredBy(reelId, publicAuthorId));
+        }
+        await context.SaveChangesAsync();
+
+        var service = new CandidateService(context);
+        var candidates = await service.GetReelCandidatesAsync(UserId, 10);
+
+        Assert.Equal(10, candidates.Count);
+        var friend = Assert.Single(candidates, item => item.Id == friendReelId);
+        Assert.Equal("friend", friend.Source);
+        Assert.Equal(friendReelId, candidates[0].Id);
+    }
+
+    [Fact]
+    public async Task PostCandidates_ReturnPolicyFilteredMetadataWithoutContentOrMedia()
+    {
+        await using var context = CreateContext();
+        context.ObjectsTb.AddRange(
+            User(200),
+            Group(300, privacy: 0),
+            Post(4_000, GraphObjectType.FeedPost, privacy: 0),
+            Post(4_001, GraphObjectType.GroupPost, privacy: 0));
+        context.AssociationsTb.AddRange(
+            Edge(UserId, GraphAssociationType.Friend, 200),
+            Edge(UserId, GraphAssociationType.Member, 300),
+            Authored(200, 4_000),
+            AuthoredBy(4_000, 200),
+            Authored(200, 4_001),
+            AuthoredBy(4_001, 200),
+            Edge(300, GraphAssociationType.Published, 4_001));
+        await context.SaveChangesAsync();
+
+        var service = new CandidateService(context);
+        var candidates = await service.GetPostCandidatesAsync(UserId, 20);
+
+        Assert.Equal(2, candidates.Count);
+        var feed = Assert.Single(candidates, item => item.Id == 4_000);
+        Assert.Equal(200, feed.AuthorId);
+        Assert.Equal(GraphObjectType.FeedPost, feed.ContentType);
+        Assert.Equal("friend", feed.Source);
+        Assert.Null(feed.GroupId);
+        Assert.NotEqual(string.Empty, feed.CreatedAt);
+
+        var group = Assert.Single(candidates, item => item.Id == 4_001);
+        Assert.Equal(GraphObjectType.GroupPost, group.ContentType);
+        Assert.Equal(300, group.GroupId);
+        Assert.Equal("group_member", group.Source);
+    }
+
+    [Fact]
+    public async Task PostCandidates_OverfetchesBeforePrivacyQuotaSoVisibleOlderContentSurvives()
+    {
+        await using var context = CreateContext();
+        const long friendId = 200;
+        const long visibleOlderPostId = 5_000;
+        context.ObjectsTb.Add(User(friendId));
+        context.AssociationsTb.Add(Edge(UserId, GraphAssociationType.Friend, friendId));
+        context.ObjectsTb.Add(Post(visibleOlderPostId, GraphObjectType.FeedPost, privacy: 2));
+        context.AssociationsTb.AddRange(
+            Authored(friendId, visibleOlderPostId),
+            AuthoredBy(visibleOlderPostId, friendId));
+        foreach (var postId in Enumerable.Range(5_001, 4).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(postId, GraphObjectType.FeedPost, privacy: 3));
+            context.AssociationsTb.AddRange(Authored(friendId, postId), AuthoredBy(postId, friendId));
+        }
+
+        await context.SaveChangesAsync();
+        var service = new CandidateService(context);
+
+        var candidates = await service.GetPostCandidatesAsync(UserId, 2);
+
+        var visible = Assert.Single(candidates);
+        Assert.Equal(visibleOlderPostId, visible.Id);
+        Assert.Equal("friend", visible.Source);
+    }
+
+    [Fact]
+    public async Task PostCandidates_IncludePrivateSelfContentButDoNotBypassPrivateGroupMembership()
+    {
+        await using var context = CreateContext();
+        const long selfFeedId = 6_000;
+        const long selfReelId = 6_001;
+        const long allowedGroupPostId = 6_002;
+        const long forbiddenGroupPostId = 6_003;
+        const long memberGroupId = 700;
+        const long otherPrivateGroupId = 701;
+        context.ObjectsTb.AddRange(
+            Group(memberGroupId, privacy: 1),
+            Group(otherPrivateGroupId, privacy: 1),
+            Post(selfFeedId, GraphObjectType.FeedPost, privacy: 3),
+            Post(selfReelId, GraphObjectType.Reel, privacy: 3),
+            Post(allowedGroupPostId, GraphObjectType.GroupPost, privacy: 0),
+            Post(forbiddenGroupPostId, GraphObjectType.GroupPost, privacy: 0));
+        context.AssociationsTb.AddRange(
+            Edge(UserId, GraphAssociationType.Member, memberGroupId),
+            Authored(UserId, selfFeedId), AuthoredBy(selfFeedId, UserId),
+            Authored(UserId, selfReelId), AuthoredBy(selfReelId, UserId),
+            Authored(UserId, allowedGroupPostId), AuthoredBy(allowedGroupPostId, UserId),
+            Authored(UserId, forbiddenGroupPostId), AuthoredBy(forbiddenGroupPostId, UserId),
+            Edge(memberGroupId, GraphAssociationType.Published, allowedGroupPostId),
+            Edge(otherPrivateGroupId, GraphAssociationType.Published, forbiddenGroupPostId));
+        await context.SaveChangesAsync();
+        var service = new CandidateService(context);
+
+        var candidates = await service.GetPostCandidatesAsync(UserId, 20);
+
+        Assert.Contains(candidates, item => item.Id == selfFeedId && item.Source == "self");
+        Assert.Contains(candidates, item => item.Id == selfReelId && item.Source == "self");
+        Assert.Contains(candidates, item => item.Id == allowedGroupPostId && item.Source == "self");
+        Assert.DoesNotContain(candidates, item => item.Id == forbiddenGroupPostId);
+    }
+
+    [Fact]
+    public async Task PostCandidates_RoundRobinAuthorsPreventsAProlificFriendFromCrowdingOutAnother()
+    {
+        await using var context = CreateContext();
+        const long prolificFriendId = 200;
+        const long secondFriendId = 201;
+        const long secondFriendPostId = 7_000;
+        context.ObjectsTb.AddRange(User(prolificFriendId), User(secondFriendId));
+        context.AssociationsTb.AddRange(
+            Edge(UserId, GraphAssociationType.Friend, prolificFriendId),
+            Edge(UserId, GraphAssociationType.Friend, secondFriendId));
+        context.ObjectsTb.Add(Post(secondFriendPostId, GraphObjectType.FeedPost, privacy: 2));
+        context.AssociationsTb.AddRange(
+            Authored(secondFriendId, secondFriendPostId),
+            AuthoredBy(secondFriendPostId, secondFriendId));
+        foreach (var postId in Enumerable.Range(8_000, 30).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(postId, GraphObjectType.FeedPost, privacy: 2));
+            context.AssociationsTb.AddRange(
+                Authored(prolificFriendId, postId),
+                AuthoredBy(postId, prolificFriendId));
+        }
+
+        await context.SaveChangesAsync();
+        var service = new CandidateService(context);
+
+        var candidates = await service.GetPostCandidatesAsync(UserId, 10);
+
+        Assert.Equal(10, candidates.Count);
+        Assert.Contains(candidates, item => item.Id == secondFriendPostId);
+        Assert.True(candidates.Select(item => item.AuthorId).Distinct().Count() >= 2);
+    }
+
+    [Fact]
+    public async Task ReelCandidates_FollowingModeFillsFromRelationshipSourcesWithoutDiscoveryLeakage()
+    {
+        await using var context = CreateContext();
+        const long friendId = 200;
+        const long followedId = 201;
+        const long publicAuthorId = 202;
+        context.ObjectsTb.AddRange(User(friendId), User(followedId), User(publicAuthorId));
+        context.AssociationsTb.AddRange(
+            Edge(UserId, GraphAssociationType.Friend, friendId),
+            Edge(UserId, GraphAssociationType.Followed, followedId));
+        foreach (var reelId in Enumerable.Range(9_000, 20).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(reelId, GraphObjectType.Reel, privacy: 2));
+            context.AssociationsTb.AddRange(Authored(friendId, reelId), AuthoredBy(reelId, friendId));
+        }
+
+        foreach (var reelId in Enumerable.Range(10_000, 20).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(reelId, GraphObjectType.Reel, privacy: 1));
+            context.AssociationsTb.AddRange(Authored(followedId, reelId), AuthoredBy(reelId, followedId));
+        }
+
+        foreach (var reelId in Enumerable.Range(11_000, 40).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(reelId, GraphObjectType.Reel, privacy: 0));
+            context.AssociationsTb.AddRange(Authored(publicAuthorId, reelId), AuthoredBy(reelId, publicAuthorId));
+        }
+
+        await context.SaveChangesAsync();
+        var service = new CandidateService(context);
+
+        var candidates = await service.GetReelCandidatesAsync(UserId, 30, "FOLLOWING");
+
+        Assert.Equal(30, candidates.Count);
+        Assert.All(candidates, item => Assert.Contains(item.Source, new[] { "friend", "followed" }));
+        Assert.DoesNotContain(candidates, item => item.AuthorId == publicAuthorId);
+    }
+
+    [Fact]
+    public async Task ReelCandidates_RejectUnknownMode()
+    {
+        await using var context = CreateContext();
+        var service = new CandidateService(context);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            service.GetReelCandidatesAsync(UserId, 20, "POPULAR"));
+    }
+
+    [Fact]
+    public async Task PostCandidates_FilterPolicyBeforeSourceCapsSoInvalidBurstsDoNotStarveOlderVisibleRows()
+    {
+        await using var context = CreateContext();
+        const long blockedAuthorId = 200;
+        const long memberAuthorId = 201;
+        const long publicAuthorId = 202;
+        const long privateGroupAuthorId = 203;
+        const long memberGroupId = 300;
+        const long publicGroupId = 301;
+        const long privateGroupId = 302;
+        const long visibleFeedId = 1_200;
+        const long visibleMemberGroupPostId = 1_201;
+        const long visiblePublicGroupPostId = 1_202;
+        context.ObjectsTb.AddRange(
+            User(blockedAuthorId), User(memberAuthorId), User(publicAuthorId), User(privateGroupAuthorId),
+            Group(memberGroupId, privacy: 1),
+            Group(publicGroupId, privacy: 0),
+            Group(privateGroupId, privacy: 1),
+            Post(visibleFeedId, GraphObjectType.FeedPost, privacy: 0),
+            Post(visibleMemberGroupPostId, GraphObjectType.GroupPost, privacy: 0),
+            Post(visiblePublicGroupPostId, GraphObjectType.GroupPost, privacy: 0));
+        context.AssociationsTb.AddRange(
+            Edge(UserId, GraphAssociationType.Member, memberGroupId),
+            Edge(UserId, GraphAssociationType.Blocked, blockedAuthorId),
+            Authored(publicAuthorId, visibleFeedId), AuthoredBy(visibleFeedId, publicAuthorId),
+            Authored(memberAuthorId, visibleMemberGroupPostId), AuthoredBy(visibleMemberGroupPostId, memberAuthorId),
+            Edge(memberGroupId, GraphAssociationType.Published, visibleMemberGroupPostId),
+            Authored(publicAuthorId, visiblePublicGroupPostId), AuthoredBy(visiblePublicGroupPostId, publicAuthorId),
+            Edge(publicGroupId, GraphAssociationType.Published, visiblePublicGroupPostId));
+
+        foreach (var postId in Enumerable.Range(2_000, 40).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(postId, GraphObjectType.FeedPost, privacy: 0));
+            context.AssociationsTb.AddRange(Authored(blockedAuthorId, postId), AuthoredBy(postId, blockedAuthorId));
+        }
+
+        foreach (var postId in Enumerable.Range(3_000, 40).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(postId, GraphObjectType.GroupPost, privacy: 0));
+            context.AssociationsTb.AddRange(
+                Authored(blockedAuthorId, postId),
+                AuthoredBy(postId, blockedAuthorId),
+                Edge(memberGroupId, GraphAssociationType.Published, postId));
+        }
+
+        foreach (var postId in Enumerable.Range(4_000, 70).Select(value => (long)value))
+        {
+            context.ObjectsTb.Add(Post(postId, GraphObjectType.GroupPost, privacy: 0));
+            context.AssociationsTb.AddRange(
+                Authored(privateGroupAuthorId, postId),
+                AuthoredBy(postId, privateGroupAuthorId),
+                Edge(privateGroupId, GraphAssociationType.Published, postId));
+        }
+
+        await context.SaveChangesAsync();
+        var service = new CandidateService(context);
+
+        var candidates = await service.GetPostCandidatesAsync(UserId, 10);
+
+        Assert.Contains(candidates, item => item.Id == visibleFeedId);
+        Assert.Contains(candidates, item => item.Id == visibleMemberGroupPostId);
+        Assert.Contains(candidates, item => item.Id == visiblePublicGroupPostId);
+        Assert.DoesNotContain(candidates, item => item.AuthorId == blockedAuthorId);
+        Assert.DoesNotContain(candidates, item => item.GroupId == privateGroupId);
     }
 
     private static MyDbContext CreateContext()

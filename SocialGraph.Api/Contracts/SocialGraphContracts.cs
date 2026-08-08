@@ -349,6 +349,33 @@ public sealed record CandidateItemResult(
     string Source,
     string CreatedAt);
 
+/// <summary>
+/// Metadata-only candidate projection consumed by Recommendation.  The projection deliberately
+/// contains no post text, media URL or privacy payload: SocialGraph remains the policy boundary
+/// and the caller must hydrate every ID through the normal viewer-aware read model afterwards.
+/// </summary>
+public sealed record RecommendationCandidateResult(
+    long Id,
+    long AuthorId,
+    string Source,
+    string CreatedAt,
+    short ContentType,
+    long? GroupId = null);
+
+/// <summary>
+/// A single browser impression. IdempotencyKey is a bounded opaque retry token validated at the
+/// boundary; durable de-duplication uses a server-owned viewer/target/time-bucket key. It is never
+/// an identity or authorization input. Dwell/completion are bounded hints.
+/// </summary>
+public sealed record RecommendationImpressionItemInput(
+    [property: GraphQLType(typeof(NonNullType<IdType>))] string TargetId,
+    string IdempotencyKey,
+    int? DwellMs = null,
+    double? CompletionPct = null);
+
+public sealed record RecommendationImpressionInput(
+    IReadOnlyList<RecommendationImpressionItemInput> Items);
+
 public sealed record ProfilePostPageResult(
     IReadOnlyList<IHomePostResult> Items,
     string? EndCursor,

@@ -147,6 +147,78 @@ public sealed class ExternalServiceOutboxDispatchTests
     }
 
     [Fact]
+    public async Task RecommendationImpressionsDispatch_ForwardsBoundedItems()
+    {
+        var handler = new CapturingHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        var client = CreateClient(handler);
+        var observedAt = DateTimeOffset.Parse("2026-08-09T02:00:00Z");
+        var message = Message(
+            IntegrationEventType.RecommendationImpressions,
+            JsonSerializer.Serialize(new RecommendationImpressionEvent(
+                123,
+                observedAt,
+                [new RecommendationImpressionEventItem(456, "server-key", 2_000, 75)])));
+
+        await client.DispatchAsync(message);
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal(HttpMethod.Post, request.Method);
+        Assert.Equal("/internal/recommendation/users/123/impressions", request.Uri.AbsolutePath);
+        Assert.Equal(message.idempotency_key, Assert.Single(request.Headers["Idempotency-Key"]));
+        using var body = JsonDocument.Parse(request.Body!);
+        Assert.Equal(observedAt, body.RootElement.GetProperty("occurredAt").GetDateTimeOffset());
+        var item = Assert.Single(body.RootElement.GetProperty("items").EnumerateArray());
+        Assert.Equal(456, item.GetProperty("targetId").GetInt64());
+        Assert.Equal("server-key", item.GetProperty("idempotencyKey").GetString());
+        Assert.Equal(2_000, item.GetProperty("dwellMs").GetInt32());
+        Assert.Equal(75, item.GetProperty("completionPct").GetDouble());
+    }
+
+    [Fact]
+    public async Task RecommendationImpressionsDispatch_NormalizesMissingMetricsToNumericDefaults()
+    {
+        var handler = new CapturingHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        var client = CreateClient(handler);
+        var observedAt = DateTimeOffset.Parse("2026-08-09T02:00:00Z");
+        var message = Message(
+            IntegrationEventType.RecommendationImpressions,
+            JsonSerializer.Serialize(new RecommendationImpressionEvent(
+                123,
+                observedAt,
+                [new RecommendationImpressionEventItem(456, "server-key")])));
+
+        await client.DispatchAsync(message);
+
+        var request = Assert.Single(handler.Requests);
+        using var body = JsonDocument.Parse(request.Body!);
+        var item = Assert.Single(body.RootElement.GetProperty("items").EnumerateArray());
+        Assert.Equal(JsonValueKind.Number, item.GetProperty("dwellMs").ValueKind);
+        Assert.Equal(0, item.GetProperty("dwellMs").GetInt32());
+        Assert.Equal(JsonValueKind.Number, item.GetProperty("completionPct").ValueKind);
+        Assert.Equal(0d, item.GetProperty("completionPct").GetDouble());
+    }
+
+    [Fact]
+    public async Task RecommendationImpressionsDispatch_RejectsPoisonedBatchBeforeNetwork()
+    {
+        var handler = new CapturingHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        var client = CreateClient(handler);
+        var message = Message(
+            IntegrationEventType.RecommendationImpressions,
+            JsonSerializer.Serialize(new RecommendationImpressionEvent(
+                123,
+                DateTimeOffset.Parse("2026-08-09T02:00:00Z"),
+                [
+                    new RecommendationImpressionEventItem(456, "server-key-a", 1_000, 50),
+                    new RecommendationImpressionEventItem(456, "server-key-b", 1_000, 50)
+                ])));
+
+        await Assert.ThrowsAsync<PermanentOutboxException>(() => client.DispatchAsync(message));
+
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
     public async Task MediaFinalizeDispatch_UsesUploadInternalContract()
     {
         var handler = new CapturingHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)

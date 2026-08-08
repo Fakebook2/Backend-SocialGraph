@@ -1,5 +1,7 @@
 namespace SocialGraph.Api.Service;
 
+using SocialGraph.Api.Infrastructure.Outbox;
+
 public interface IExternalServiceClient
 {
     Task NotifyAsync(long creatorId, long receiverId, short actionType, long? objectId, object? data, CancellationToken cancellationToken = default);
@@ -20,6 +22,10 @@ public interface IExternalServiceClient
     Task CreatePostEmbeddingAsync(long postId, string content, IReadOnlyList<string> mediaUrls, CancellationToken cancellationToken = default);
     Task DeletePostEmbeddingAsync(long postId, CancellationToken cancellationToken = default);
     Task RecordRecommendationInteractionAsync(long userId, long targetId, string action, CancellationToken cancellationToken = default);
+    Task RecordRecommendationImpressionsAsync(
+        long userId,
+        IReadOnlyList<RecommendationImpressionEventItem> items,
+        CancellationToken cancellationToken = default);
     Task CreateMessengerUserAsync(long userId, CancellationToken cancellationToken = default);
     Task DeleteMessengerUserAsync(long userId, CancellationToken cancellationToken = default);
     /// <param name="ownerUserId">

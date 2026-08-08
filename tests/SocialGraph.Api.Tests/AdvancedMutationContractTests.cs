@@ -1,14 +1,201 @@
 namespace SocialGraph.Api.Tests;
 
 using HotChocolate;
+using HotChocolate.Execution;
+using Microsoft.Extensions.DependencyInjection;
 using Moq;
 using SocialGraph.Api.Contracts;
 using SocialGraph.Api.Infrastructure;
+using SocialGraph.Api.Infrastructure.Outbox;
 using SocialGraph.Api.Service;
 using SocialGraph.Api.SubGraphQL;
 
 public sealed class AdvancedMutationContractTests
 {
+    [Fact]
+    public async Task RecommendationImpressions_GraphQlIdInputPreservesSnowflakeBeyondJavaScriptSafeInteger()
+    {
+        const long viewerId = 100;
+        const long snowflakeId = 9_007_199_254_740_993;
+        var content = new Mock<IContentGraphService>(MockBehavior.Strict);
+        content.Setup(item => item.GetPostDetailsAsync(
+                viewerId,
+                It.Is<IReadOnlyList<long>>(ids => ids.SequenceEqual(new[] { snowflakeId })),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new IHomePostResult[]
+            {
+                new FeedPostDetailResult(
+                    snowflakeId,
+                    GraphObjectType.FeedPost,
+                    "visible",
+                    0,
+                    "2026-08-09T00:00:00Z",
+                    new PostAuthorResult(viewerId, "Viewer", "", false, false),
+                    [])
+            });
+        var external = new Mock<IExternalServiceClient>(MockBehavior.Strict);
+        external.Setup(item => item.RecordRecommendationImpressionsAsync(
+                viewerId,
+                It.Is<IReadOnlyList<RecommendationImpressionEventItem>>(items =>
+                    items.Count == 1 && items[0].TargetId == snowflakeId),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var trusted = new Mock<ITrustedCallerAccessor>(MockBehavior.Strict);
+        trusted.Setup(item => item.RequireUserId()).Returns(viewerId);
+        var services = new ServiceCollection();
+        services.AddSingleton(content.Object);
+        services.AddSingleton(external.Object);
+        services.AddSingleton(trusted.Object);
+        services
+            .AddGraphQLServer()
+            .AddQueryType<Query>()
+            .AddMutationType<Mutation>()
+            .AddType<RecommendationItemResult>()
+            .AddTypeExtension<RecommendationItemResolvers>()
+            .AddType<FeedPostDetailResult>()
+            .AddType<ReelDetailResult>()
+            .AddType<GroupPostDetailResult>()
+            .AddType<NormalStoryResult>()
+            .AddType<FeedPostShareStoryResult>()
+            .AddType<ReelShareStoryResult>()
+            .AddType<FeedPostSharedSourceResult>()
+            .AddType<ReelSharedSourceResult>();
+        await using var provider = services.BuildServiceProvider();
+        var executor = await provider.GetRequiredService<IRequestExecutorProvider>().GetExecutorAsync();
+        var request = OperationRequestBuilder.New()
+            .SetDocument(
+                """
+                mutation Record($input: RecommendationImpressionInput!) {
+                  recordRecommendationImpressions(input: $input) { success }
+                }
+                """)
+            .SetVariableValues(new Dictionary<string, object?>
+            {
+                ["input"] = new Dictionary<string, object?>
+                {
+                    ["items"] = new object[]
+                    {
+                        new Dictionary<string, object?>
+                        {
+                            ["targetId"] = snowflakeId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                            ["idempotencyKey"] = "browser-snowflake"
+                        }
+                    }
+                }
+            })
+            .Build();
+
+        var result = await executor.ExecuteAsync(request);
+
+        Assert.Empty(result.ExpectOperationResult().Errors);
+        Assert.Contains("targetId: ID!", executor.Schema.ToString());
+        content.VerifyAll();
+        external.VerifyAll();
+        trusted.VerifyAll();
+    }
+
+    [Fact]
+    public async Task RecommendationImpressions_UsesVisibleBatchAndTrustedActor()
+    {
+        const long viewerId = 100;
+        const long visibleId = 200;
+        const long hiddenId = 201;
+        var content = new Mock<IContentGraphService>(MockBehavior.Strict);
+        content.Setup(item => item.GetPostDetailsAsync(
+                viewerId,
+                It.Is<IReadOnlyList<long>>(ids => ids.SequenceEqual(new[] { visibleId, hiddenId })),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new IHomePostResult[]
+            {
+                new FeedPostDetailResult(
+                    visibleId,
+                    GraphObjectType.FeedPost,
+                    "visible",
+                    0,
+                    "2026-08-09T00:00:00Z",
+                    new PostAuthorResult(viewerId, "Viewer", "", false, false),
+                    [])
+            });
+        var external = new Mock<IExternalServiceClient>(MockBehavior.Strict);
+        external.Setup(item => item.RecordRecommendationImpressionsAsync(
+                viewerId,
+                It.Is<IReadOnlyList<RecommendationImpressionEventItem>>(items =>
+                    items.Count == 1 && items[0].TargetId == visibleId && items[0].IdempotencyKey == "browser-key"),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var trusted = new Mock<ITrustedCallerAccessor>(MockBehavior.Strict);
+        trusted.Setup(item => item.RequireUserId()).Returns(viewerId);
+
+        var result = await new Mutation().RecordRecommendationImpressionsAsync(
+            new RecommendationImpressionInput(
+                [
+                    new RecommendationImpressionItemInput(visibleId.ToString(), "browser-key", 1_000, 50),
+                    new RecommendationImpressionItemInput(hiddenId.ToString(), "hidden-key", 1_000, 50)
+                ]),
+            content.Object,
+            external.Object,
+            trusted.Object,
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        content.VerifyAll();
+        external.VerifyAll();
+        trusted.VerifyAll();
+    }
+
+    [Fact]
+    public async Task RecommendationImpressions_RejectsDuplicateTargetsBeforeVisibilityLookup()
+    {
+        var content = new Mock<IContentGraphService>(MockBehavior.Strict);
+        var external = new Mock<IExternalServiceClient>(MockBehavior.Strict);
+        var trusted = new Mock<ITrustedCallerAccessor>(MockBehavior.Strict);
+        trusted.Setup(item => item.RequireUserId()).Returns(100);
+
+        var exception = await Assert.ThrowsAsync<GraphQLException>(() => new Mutation().RecordRecommendationImpressionsAsync(
+            new RecommendationImpressionInput(
+                [
+                    new RecommendationImpressionItemInput("200", "a"),
+                    new RecommendationImpressionItemInput("200", "b")
+                ]),
+            content.Object,
+            external.Object,
+            trusted.Object,
+            CancellationToken.None));
+
+        Assert.Equal("BAD_USER_INPUT", exception.Errors.Single().Code);
+        content.Verify(item => item.GetPostDetailsAsync(
+            It.IsAny<long>(),
+            It.IsAny<IReadOnlyList<long>>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+        external.Verify(item => item.RecordRecommendationImpressionsAsync(
+            It.IsAny<long>(),
+            It.IsAny<IReadOnlyList<RecommendationImpressionEventItem>>(),
+            It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task RecommendationImpressions_RejectsUnboundedTargetIdBeforeParsingOrLookup()
+    {
+        var content = new Mock<IContentGraphService>(MockBehavior.Strict);
+        var external = new Mock<IExternalServiceClient>(MockBehavior.Strict);
+        var trusted = new Mock<ITrustedCallerAccessor>(MockBehavior.Strict);
+        trusted.Setup(item => item.RequireUserId()).Returns(100);
+
+        var exception = await Assert.ThrowsAsync<GraphQLException>(() =>
+            new Mutation().RecordRecommendationImpressionsAsync(
+                new RecommendationImpressionInput(
+                    [new RecommendationImpressionItemInput(new string('9', 20), "bounded-key")]),
+                content.Object,
+                external.Object,
+                trusted.Object,
+                CancellationToken.None));
+
+        Assert.Equal("BAD_USER_INPUT", exception.Errors.Single().Code);
+        content.VerifyNoOtherCalls();
+        external.VerifyNoOtherCalls();
+        trusted.VerifyAll();
+    }
+
     [Fact]
     public async Task SharePostToGroup_UsesTrustedActorAndRequiresDestinationMembership()
     {

@@ -228,6 +228,36 @@ CREATE INDEX idx_associations_inverse ON Associations (id2, atype, id1);
 Không còn association Owned. Media graph chỉ tồn tại khi còn ít nhất một association Contained từ post/reel/story; detach parent cuối cùng sẽ xóa Media và asset tương ứng. Mỗi object Media dùng reference ổn định `socialgraph:media:<mediaId>` ở Upload Server; avatar/background user và group dùng reference slot riêng. Vì vậy xoá Media A luôn detach đúng A, không xoá nhầm file đang được Media B hoặc profile khác tái sử dụng. Exact reference được authorize trước commit bằng `operationAt` từ DB; response bắt buộc có `exactReferences=true`, `lifecycleVersion>=3` và `referenceCount`. Nếu parent transaction thất bại, service best-effort detach đúng reservation của attempt đó với cùng timestamp. Outbox mới gửi `references + operationAt`, vẫn đọc được row URL-only cũ khi rolling deploy; lỗi lifecycle tạm thời retry lâu dài bằng backoff có giới hạn thay vì chết sau budget chung. Ownerless attach/repair online không được phép; missing legacy refs phải reconcile offline.
 updatePost(input: { id, privacy?, content?, media? }) áp dụng cho feed post, group post và reel; feed post/reel dùng cùng privacy 0/1/2/3. Field bị omit được giữ nguyên; media=[] detach toàn bộ và garbage-collect media không còn parent.
 Home post candidates gồm feed post, group post và reel. Reel được hydrate thành `ReelDetail` trong union `HomePost` và frontend dùng chung card hiển thị với feed post. `createReel` nhận `aspectRatio` trong khoảng 9/16..16/9 cùng `focalPointX`/`focalPointY` trong [0,1]; `ContentResult` và `ReelDetail` trả lại đủ metadata trình bày này. Client cũ có thể bỏ qua focal point và sẽ được căn giữa.
+Recommendation dùng endpoint nội bộ có chữ ký `GET /internal/recommendation/content-candidates?userId=&limit=`
+(alias tương thích `post-candidates`) để nhận projection metadata giới hạn: `id`, `authorId`,
+`createdAt`, `contentType`, `groupId` và `source`. Endpoint tái sử dụng chính xác pipeline candidate
+hiện hữu nên privacy, membership và block hai chiều vẫn được lọc trước khi trả kết quả; không trả
+content/media và không thay đổi schema object canonical. `post-candidate-ids` vẫn được giữ trong
+giai đoạn rolling deploy.
+`source` phân biệt `group_member` (viewer đang tham gia/quản trị) với `public_group` (khám phá
+nhóm công khai), ngoài `self`, `friend`, `followed` và `recent_public`, để reranker có thể áp dụng
+affinity mà không suy đoán membership từ phía Recommendation.
+Trước giới hạn pool, SocialGraph merge nguồn theo lịch deterministic 10% self, 20% friend, 20%
+followed, 20% group đang tham gia, 20% public feed và 10% public group. Nguồn thiếu dữ liệu tự
+nhường slot; do đó public firehose không thể crowd-out toàn bộ quan hệ nhưng trang vẫn được fill
+tối đa. FeedPost/Reel do chính viewer tạo được nhận mọi privacy hợp lệ; GroupPost của viewer vẫn
+phải qua policy thành viên/nhóm công khai như bình thường. Một indexed lateral query có giới hạn
+riêng mỗi tác giả lấy quan hệ, privacy được lọc trước accepted quota, rồi mỗi source round-robin để một tác
+giả đăng nhiều không chiếm toàn bộ cửa sổ.
+Các nguồn khám phá public lọc privacy và block hai chiều ngay trong freshness window có giới hạn,
+ưu tiên quota mỗi author rồi mới dùng phần dư để fill; một burst private/blocked không thể làm rỗng
+pool trong khi vẫn còn candidate hợp lệ cũ hơn trong cửa sổ.
+`reel-candidates` nhận `mode=FOR_YOU|FOLLOWING`. FOR_YOU merge 10% self, 30% friend, 30% follow
+và 30% public; FOLLOWING chỉ fill từ friend/follow trước cap và không nhận discovery công khai.
+
+`recordRecommendationImpressions(input)` nhận tối đa 50 item duy nhất gồm `targetId: ID!` ở dạng
+chuỗi thập phân Snowflake, opaque retry `idempotencyKey`, `dwellMs` (0..900000) và `completionPct`
+(0..100). Actor luôn lấy từ trusted Gateway; SocialGraph hydrate batch và bỏ im lặng target không
+còn nhìn thấy. Thời điểm quan sát lấy từ database clock và được giữ nguyên khi outbox retry. Khóa
+lưu trữ do server sinh theo viewer/target/bucket UTC 5 phút, bảo đảm tối đa một impression trong
+mỗi bucket dù client đổi retry key. Các item hợp lệ đi qua outbox `recommendation.impressions.v1`
+và signed internal REST. Impression không cấp quyền đọc và không thể dùng để dò private/deleted
+content.
 Fast-search hydration không nhận `viewerId` từ input. `UserSearchResult` trả `viewerIsSelf`,
 `viewerIsFriend` và `viewerIsFollowing`; `GroupSearchResult` trả `viewerIsMember` (member hoặc admin), đều được tính từ
 trusted Gateway caller và association hiện tại.

@@ -250,14 +250,26 @@ pool trong khi vẫn còn candidate hợp lệ cũ hơn trong cửa sổ.
 `reel-candidates` nhận `mode=FOR_YOU|FOLLOWING`. FOR_YOU merge 10% self, 30% friend, 30% follow
 và 30% public; FOLLOWING chỉ fill từ friend/follow trước cap và không nhận discovery công khai.
 
+Các interaction `LIKE/UNLIKE/SAVE/UNSAVE/WATCH/SHARE/COMMENT` gửi sang Recommendation có thêm
+`occurredAt` do SocialGraph lấy trực tiếp từ clock PostgreSQL trước khi enqueue signed outbox;
+browser không được truyền thời gian này. Trường nullable chỉ để drain những outbox row cũ khi
+rolling deploy. Clock sample không tham gia storage idempotency key, nên retry cùng domain
+operation vẫn hội tụ vào một event và không huấn luyện vector hai lần.
+
 `recordRecommendationImpressions(input)` nhận tối đa 50 item duy nhất gồm `targetId: ID!` ở dạng
 chuỗi thập phân Snowflake, opaque retry `idempotencyKey`, `dwellMs` (0..900000) và `completionPct`
 (0..100). Actor luôn lấy từ trusted Gateway; SocialGraph hydrate batch và bỏ im lặng target không
-còn nhìn thấy. Thời điểm quan sát lấy từ database clock và được giữ nguyên khi outbox retry. Khóa
-lưu trữ do server sinh theo viewer/target/bucket UTC 5 phút, bảo đảm tối đa một impression trong
-mỗi bucket dù client đổi retry key. Các item hợp lệ đi qua outbox `recommendation.impressions.v1`
-và signed internal REST. Impression không cấp quyền đọc và không thể dùng để dò private/deleted
-content.
+còn nhìn thấy. Sau bước authorization này server mới phân loại `POST`/`VIDEO_POST`/`REEL`, xác định
+nội dung của chính viewer và ánh xạ metric vào một tập quality tier cố định; browser không có field
+để tự khai ba giá trị đó. `VIDEO_POST` chỉ là telemetry nội bộ cho FeedPost/GroupPost có media video,
+không đổi business type/privacy; tier lấy tín hiệu mạnh hơn giữa attentive card dwell và completion
+của video thực sự đang phát/nhìn thấy. Thời điểm quan sát lấy từ database clock và được giữ nguyên
+khi outbox retry. Khóa
+lưu trữ v3 do server sinh theo viewer/target/bucket UTC 5 phút/kind/tier: retry cùng tier hội tụ,
+còn evidence mạnh hơn được phép nâng tier trong cùng bucket nhưng cardinality luôn bị chặn bởi tập
+tier nhỏ cố định. Self impression vẫn dùng cho seen suppression nhưng có cờ để Recommendation bỏ
+qua preference learning. Các item hợp lệ đi qua outbox `recommendation.impressions.v1` và signed
+internal REST. Impression không cấp quyền đọc và không thể dùng để dò private/deleted content.
 Fast-search hydration không nhận `viewerId` từ input. `UserSearchResult` trả `viewerIsSelf`,
 `viewerIsFriend` và `viewerIsFollowing`; `GroupSearchResult` trả `viewerIsMember` (member hoặc admin), đều được tính từ
 trusted Gateway caller và association hiện tại.

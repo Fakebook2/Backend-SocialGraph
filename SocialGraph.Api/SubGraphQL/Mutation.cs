@@ -526,8 +526,29 @@ public class Mutation
             viewerId,
             normalized.Select(item => item.TargetId).ToArray(),
             cancellationToken);
-        var visibleIds = visiblePosts.Select(HomePostId).ToHashSet();
-        var accepted = normalized.Where(item => visibleIds.Contains(item.TargetId)).ToArray();
+        var visibleMetadata = visiblePosts.ToDictionary(
+            HomePostId,
+            post => new
+            {
+                Kind = HomePostRecommendationKind(post),
+                IsOwnContent = HomePostAuthorId(post) == viewerId
+            });
+        var accepted = normalized
+            .Where(item => visibleMetadata.ContainsKey(item.TargetId))
+            .Select(item =>
+            {
+                var metadata = visibleMetadata[item.TargetId];
+                return item with
+                {
+                    ContentKind = metadata.Kind,
+                    QualityTier = RecommendationImpressionQualityTier(
+                        metadata.Kind,
+                        item.DwellMs ?? 0,
+                        item.CompletionPct ?? 0),
+                    IsOwnContent = metadata.IsOwnContent
+                };
+            })
+            .ToArray();
         if (accepted.Length > 0)
         {
             await externalServiceClient.RecordRecommendationImpressionsAsync(
@@ -616,6 +637,77 @@ public class Mutation
         GroupPostDetailResult groupPost => groupPost.Id,
         ReelDetailResult reel => reel.Id,
         _ => 0
+    };
+
+    private static long HomePostAuthorId(IHomePostResult post) => post switch
+    {
+        FeedPostDetailResult feedPost => feedPost.Author.Id,
+        GroupPostDetailResult groupPost => groupPost.Author.Id,
+        ReelDetailResult reel => reel.Author.Id,
+        _ => 0
+    };
+
+    private static string HomePostRecommendationKind(IHomePostResult post) => post switch
+    {
+        ReelDetailResult => "REEL",
+        FeedPostDetailResult feedPost when
+            feedPost.Media.Any(media => media.Type == 1) ||
+            feedPost.SharedSource?.Media.Any(media => media.Type == 1) == true => "VIDEO_POST",
+        GroupPostDetailResult groupPost when
+            groupPost.Media.Any(media => media.Type == 1) ||
+            groupPost.SharedSource?.Media.Any(media => media.Type == 1) == true => "VIDEO_POST",
+        _ => "POST"
+    };
+
+    private static string RecommendationImpressionQualityTier(
+        string contentKind,
+        int dwellMs,
+        double completionPct)
+    {
+        if (contentKind == "REEL")
+        {
+            if (dwellMs == 0 && completionPct == 0) return "SEEN";
+            if (dwellMs < 800 && completionPct < 10) return "SKIP";
+            if (completionPct < 25) return "LOW";
+            if (completionPct < 60) return "MID";
+            if (completionPct < 90) return "HIGH";
+            return "COMPLETE";
+        }
+
+        if (contentKind == "VIDEO_POST")
+        {
+            if (dwellMs >= 300_000 && completionPct == 0) return "IDLE";
+            if (dwellMs < 800 && completionPct < 10) return "SKIP";
+            var postTier = dwellMs < 3_000 ? "SHORT" : dwellMs < 15_000 ? "READ" : "DEEP";
+            if (completionPct <= 0) return postTier;
+            var videoTier = completionPct < 25
+                ? "LOW"
+                : completionPct < 60
+                    ? "MID"
+                    : completionPct < 90
+                        ? "HIGH"
+                        : "COMPLETE";
+            return RecommendationImpressionTierRank(videoTier) >= RecommendationImpressionTierRank(postTier)
+                ? videoTier
+                : postTier;
+        }
+
+        if (dwellMs >= 300_000) return "IDLE";
+        if (dwellMs < 800) return "FAST_SKIP";
+        if (dwellMs < 3_000) return "SHORT";
+        if (dwellMs < 15_000) return "READ";
+        return "DEEP";
+    }
+
+    private static int RecommendationImpressionTierRank(string tier) => tier switch
+    {
+        "SKIP" or "FAST_SKIP" => 0,
+        "SHORT" or "LOW" => 1,
+        "READ" => 2,
+        "DEEP" or "MID" => 3,
+        "HIGH" => 4,
+        "COMPLETE" => 5,
+        _ => -1
     };
 
     private static string NormalizeImpressionIdempotencyKey(string? value)

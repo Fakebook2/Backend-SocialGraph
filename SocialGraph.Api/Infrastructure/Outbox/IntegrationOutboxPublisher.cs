@@ -157,17 +157,29 @@ public sealed class IntegrationOutboxPublisher : IExternalServiceClient
             cancellationToken);
     }
 
-    public Task RecordRecommendationInteractionAsync(
+    public async Task RecordRecommendationInteractionAsync(
         long userId,
         long targetId,
         string action,
         CancellationToken cancellationToken = default)
     {
-        return EnqueueAsync(
+        var occurredAt = await _outbox.GetCurrentTimeAsync(cancellationToken);
+        // Preserve the exact pre-OccurredAt payload material. Existing client retries
+        // and rows created on another replica must derive the same outbox key across a
+        // rolling deployment even though the actual new payload carries OccurredAt.
+        var legacyIdempotencyMaterial = JsonSerializer.Serialize(
+            new { userId, targetId, action },
+            JsonOptions);
+        await EnqueueAsync(
             IntegrationEventType.RecommendationInteraction,
             userId,
-            new RecommendationInteractionEvent(userId, targetId, action),
-            cancellationToken);
+            new RecommendationInteractionEvent(userId, targetId, action, occurredAt),
+            cancellationToken,
+            // OccurredAt must remain stable once queued, but a retried browser mutation
+            // obtains a fresh database-clock sample before finding the existing row.
+            // Keep that sample out of the storage key so the established operation ID
+            // still deduplicates the retry.
+            idempotencyMaterial: legacyIdempotencyMaterial);
     }
 
     public async Task RecordRecommendationImpressionsAsync(
@@ -193,7 +205,9 @@ public sealed class IntegrationOutboxPublisher : IExternalServiceClient
                     !char.IsAsciiLetterOrDigit(character) && character is not ('-' or '_' or '.' or ':')) ||
                 item.DwellMs is < 0 or > 900_000 ||
                 item.CompletionPct is { } completion &&
-                    (!double.IsFinite(completion) || completion is < 0 or > 100)))
+                    (!double.IsFinite(completion) || completion is < 0 or > 100) ||
+                item.ContentKind is not (null or "POST" or "REEL" or "VIDEO_POST") ||
+                !RecommendationImpressionQuality.IsValid(item.ContentKind, item.QualityTier)))
         {
             throw new ArgumentException("The impression batch contains an invalid item.", nameof(items));
         }
@@ -204,22 +218,29 @@ public sealed class IntegrationOutboxPublisher : IExternalServiceClient
             .OrderBy(item => item.TargetId)
             .Select(item => item with
             {
-                // The browser key is validated above, but storage idempotency is server-owned:
-                // at most one impression per trusted viewer/target/five-minute window.
+                // Browser keys, content kind and quality are never trusted. Mutation has
+                // already derived the latter two after current visibility authorization.
+                // A target can advance through only a small fixed number of tiers per bucket.
                 IdempotencyKey = "socialgraph-" + Convert.ToHexString(SHA256.HashData(
-                    Encoding.UTF8.GetBytes($"recommendation-impression:v2:{userId}:{item.TargetId}:{bucket}")))
+                    Encoding.UTF8.GetBytes(
+                        $"recommendation-impression:v3:{userId}:{item.TargetId}:{bucket}:{item.ContentKind ?? "LEGACY"}:{item.QualityTier ?? "LEGACY"}")))
                     .ToLowerInvariant()
             })
             .ToArray();
+        var sortedItemKeys = normalized
+            .Select(item => item.IdempotencyKey)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        var batchFingerprint = Convert.ToHexString(SHA256.HashData(
+            Encoding.UTF8.GetBytes(string.Join('\n', sortedItemKeys))))
+            .ToLowerInvariant();
         await EnqueueAsync(
             IntegrationEventType.RecommendationImpressions,
             userId,
             new RecommendationImpressionEvent(userId, observedAt, normalized),
             cancellationToken,
-            operationId: $"recommendation-impressions:v2:{userId}:{bucket}",
-            idempotencyMaterial: JsonSerializer.Serialize(
-                normalized.Select(item => item.IdempotencyKey).ToArray(),
-                JsonOptions));
+            operationId: $"recommendation-impressions:v3:{userId}:{bucket}:{batchFingerprint}",
+            idempotencyMaterial: batchFingerprint);
     }
 
     public Task CreateMessengerUserAsync(long userId, CancellationToken cancellationToken = default)

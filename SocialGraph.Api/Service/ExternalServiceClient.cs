@@ -178,7 +178,15 @@ public sealed class ExternalServiceClient : IExternalServiceTransport
                         GetInternalServiceUrl(
                             "Recommendation",
                             $"internal/recommendation/users/{FormatId(payload.UserId)}/interactions"),
-                        new { targetId = payload.TargetId, action = payload.Action },
+                        new
+                        {
+                            targetId = payload.TargetId,
+                            action = payload.Action,
+                            // Null is retained for old outbox rows. Recommendation accepts
+                            // the optional field during a rolling deployment and falls back
+                            // to its own clock only for that legacy case.
+                            occurredAt = payload.OccurredAt
+                        },
                         RecommendationSecretHeader,
                         "InternalServices:Recommendation:SharedSecret",
                         message.idempotency_key,
@@ -290,7 +298,9 @@ public sealed class ExternalServiceClient : IExternalServiceTransport
                             item.IdempotencyKey.Length > 128 ||
                             item.DwellMs is < 0 or > 900_000 ||
                             item.CompletionPct is { } completion &&
-                                (!double.IsFinite(completion) || completion is < 0 or > 100)))
+                                (!double.IsFinite(completion) || completion is < 0 or > 100) ||
+                            item.ContentKind is not (null or "POST" or "REEL" or "VIDEO_POST") ||
+                            !RecommendationImpressionQuality.IsValid(item.ContentKind, item.QualityTier)))
                     {
                         throw new PermanentOutboxException("Recommendation impression event is invalid.");
                     }
@@ -309,7 +319,10 @@ public sealed class ExternalServiceClient : IExternalServiceTransport
                                 targetId = item.TargetId,
                                 idempotencyKey = item.IdempotencyKey,
                                 dwellMs = item.DwellMs ?? 0,
-                                completionPct = item.CompletionPct ?? 0d
+                                completionPct = item.CompletionPct ?? 0d,
+                                contentKind = item.ContentKind,
+                                qualityTier = item.QualityTier,
+                                isOwnContent = item.IsOwnContent
                             })
                         },
                         RecommendationSecretHeader,

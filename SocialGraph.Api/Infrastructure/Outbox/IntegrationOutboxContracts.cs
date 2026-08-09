@@ -73,7 +73,14 @@ public sealed record ContentEmbeddingEvent(long ContentId, string Content, IRead
 
 public sealed record ContentProjectionDeleteEvent(long ContentId);
 
-public sealed record RecommendationInteractionEvent(long UserId, long TargetId, string Action);
+// OccurredAt is nullable only for rolling compatibility with interaction rows queued
+// before trusted observation time was added. New events always use the SocialGraph
+// database clock; the browser never supplies this value.
+public sealed record RecommendationInteractionEvent(
+    long UserId,
+    long TargetId,
+    string Action,
+    DateTimeOffset? OccurredAt = null);
 
 public sealed record RecommendationImpressionEvent(
     long UserId,
@@ -84,7 +91,39 @@ public sealed record RecommendationImpressionEventItem(
     long TargetId,
     string IdempotencyKey,
     int? DwellMs = null,
-    double? CompletionPct = null);
+    double? CompletionPct = null,
+    // Server-derived POST/VIDEO_POST/REEL only after viewer-aware hydration succeeds.
+    // Null keeps pre-upgrade outbox rows compatible during rolling deployment.
+    string? ContentKind = null,
+    // A tiny server-derived bucket bounds richer updates inside one UTC window.
+    string? QualityTier = null,
+    // Self views are useful for seen suppression but must not train preferences.
+    bool? IsOwnContent = null);
+
+public static class RecommendationImpressionQuality
+{
+    private static readonly HashSet<string> PostTiers =
+        ["FAST_SKIP", "SHORT", "READ", "DEEP", "IDLE"];
+    private static readonly HashSet<string> ReelTiers =
+        ["SEEN", "SKIP", "LOW", "MID", "HIGH", "COMPLETE"];
+    private static readonly HashSet<string> VideoPostTiers =
+        ["IDLE", "SKIP", "SHORT", "READ", "DEEP", "LOW", "MID", "HIGH", "COMPLETE"];
+
+    public static bool IsValid(string? contentKind, string? qualityTier)
+    {
+        // Both null is the only legacy representation. Kind-only is accepted for
+        // the brief rolling state where kind existed before tier enrichment.
+        if (contentKind is null) return qualityTier is null;
+        if (qualityTier is null) return contentKind is "POST" or "REEL" or "VIDEO_POST";
+        return contentKind switch
+        {
+            "POST" => PostTiers.Contains(qualityTier),
+            "REEL" => ReelTiers.Contains(qualityTier),
+            "VIDEO_POST" => VideoPostTiers.Contains(qualityTier),
+            _ => false
+        };
+    }
+}
 
 public sealed record MessagingUserEvent(long UserId);
 

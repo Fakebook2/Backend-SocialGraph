@@ -823,6 +823,49 @@ public sealed class ContentProjectionTests
             AuthorId, PostId, RecommendationInteractionAction.Watch, It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    [Theory]
+    [InlineData(GraphAssociationType.Liked, RecommendationInteractionAction.Unlike)]
+    [InlineData(GraphAssociationType.Saved, RecommendationInteractionAction.Unsave)]
+    public async Task EngagementUndo_FailsClosedWhenRecommendationOutboxCannotBeQueued(
+        short associationType,
+        string recommendationAction)
+    {
+        await using var context = CreateContext();
+        var objects = new Mock<IObjectService>(MockBehavior.Loose);
+        objects.Setup(item => item.RetrieveObjectAsync(PostId, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SocialGraphObjectResult(PostId, GraphObjectType.FeedPost, PostJson("source", 0)));
+        var associations = new Mock<IAssociationService>(MockBehavior.Strict);
+        associations.Setup(item => item.DeleteOneAssociationAsync(
+                AuthorId,
+                associationType,
+                PostId,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        var external = new Mock<IExternalServiceClient>(MockBehavior.Loose);
+        external.Setup(item => item.RecordRecommendationInteractionAsync(
+                AuthorId,
+                PostId,
+                recommendationAction,
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new InvalidOperationException("outbox unavailable"));
+        var service = new ContentGraphService(
+            context,
+            objects.Object,
+            associations.Object,
+            external.Object);
+
+        Func<Task> operation = associationType == GraphAssociationType.Liked
+            ? () => service.UnlikeAsync(AuthorId, PostId)
+            : () => service.UnsaveAsync(AuthorId, PostId);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(operation);
+        external.Verify(item => item.RecordRecommendationInteractionAsync(
+            AuthorId,
+            PostId,
+            recommendationAction,
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
     private static MyDbContext CreateContext()
     {
         var options = new DbContextOptionsBuilder<MyDbContext>()

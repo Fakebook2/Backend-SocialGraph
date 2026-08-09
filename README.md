@@ -319,15 +319,31 @@ still fill the page.
 follow and 30% public schedule, while FOLLOWING fills exclusively from friend/follow queues before
 the final cap. The default remains FOR_YOU for rolling compatibility.
 
+Recommendation interaction events (`LIKE`, `UNLIKE`, `SAVE`, `UNSAVE`, `WATCH`, `SHARE`,
+and `COMMENT`) also carry an optional `occurredAt`. New rows always obtain it from the
+SocialGraph PostgreSQL clock before the signed outbox event is queued; it is never accepted
+from browser input and remains unchanged across delivery retries. The field stays nullable so
+pre-upgrade outbox rows can drain during a rolling deployment. Their stable operation key does
+not include the clock sample, so retrying the same domain mutation cannot train twice merely
+because it observed the database clock again.
+
 The additive `recordRecommendationImpressions(input)` mutation accepts at most 50 unique visible
 post/Reel IDs per request. `targetId` is GraphQL `ID!` and must be sent as a decimal string, so a
 Snowflake above JavaScript's safe-integer boundary is never rounded. The actor comes from the
 trusted Gateway caller; browser input contains only bounded opaque retry keys and optional bounded
 dwell/completion hints. SocialGraph rechecks visibility in one batch and silently drops unavailable
-IDs, then queues a signed `recommendation.impressions.v1` outbox event. Its observation time comes
-from the database clock and is retained across outbox retries. Storage idempotency is server-owned:
-at most one impression per trusted viewer, target and five-minute UTC bucket. No impression is
-accepted as evidence of access to a private, deleted or blocked object.
+IDs, then derives `POST`/`VIDEO_POST`/`REEL`, whether the viewer owns the content, and one quality
+tier from the bounded metrics before queuing a signed `recommendation.impressions.v1` outbox event.
+`VIDEO_POST` is internal telemetry for a normal FeedPost/GroupPost whose hydrated media contains a
+video; it does not change that object's GraphQL type, privacy, or authorization rules. Its fixed
+tier selects the stronger of attentive card dwell and active visible video completion. None of
+those three enrichment fields is exposed in the browser input. Its observation time comes from the
+database clock and is retained across outbox retries. Storage idempotency is server-owned and uses
+the trusted viewer, target, five-minute UTC bucket, content kind and one of a fixed small set of
+tiers. A retry of the same tier converges, while stronger evidence can advance within that bucket
+without allowing attacker-defined cardinality. Self impressions remain valid for seen suppression
+but are explicitly marked so Recommendation can avoid training preferences from them. No
+impression is accepted as evidence of access to a private, deleted or blocked object.
 
 Operational probes are public to the container/orchestrator: `GET /health/live` always reports process liveness; `GET /health/ready` requires PostgreSQL and reports Redis as either `available` or `postgres-fallback` without failing readiness.
 

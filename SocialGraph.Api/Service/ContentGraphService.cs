@@ -1985,17 +1985,12 @@ public sealed class ContentGraphService : IContentGraphService
 
     public async Task<bool> UnlikeAsync(long userId, long targetId, CancellationToken cancellationToken = default)
     {
-        var result = await _associationService.DeleteOneAssociationAsync(userId, GraphAssociationType.Liked, targetId, cancellationToken);
-        if (result)
-        {
-            await QueueRecommendationInteractionIfContentAsync(
-                userId,
-                targetId,
-                RecommendationInteractionAction.Unlike,
-                cancellationToken);
-        }
-
-        return result;
+        return await DeleteEngagementAndQueueRecommendationAsync(
+            userId,
+            GraphAssociationType.Liked,
+            targetId,
+            RecommendationInteractionAction.Unlike,
+            cancellationToken);
     }
 
     public async Task<bool> SaveAsync(long userId, long targetId, CancellationToken cancellationToken = default)
@@ -2015,17 +2010,65 @@ public sealed class ContentGraphService : IContentGraphService
 
     public async Task<bool> UnsaveAsync(long userId, long targetId, CancellationToken cancellationToken = default)
     {
-        var result = await _associationService.DeleteOneAssociationAsync(userId, GraphAssociationType.Saved, targetId, cancellationToken);
-        if (result)
+        return await DeleteEngagementAndQueueRecommendationAsync(
+            userId,
+            GraphAssociationType.Saved,
+            targetId,
+            RecommendationInteractionAction.Unsave,
+            cancellationToken);
+    }
+
+    private async Task<bool> DeleteEngagementAndQueueRecommendationAsync(
+        long userId,
+        short associationType,
+        long targetId,
+        string recommendationAction,
+        CancellationToken cancellationToken)
+    {
+        // The association mutation and its transactional-outbox row must share
+        // one database commit. In particular, a failed trusted-clock read or
+        // outbox insert must not leave UNLIKE/UNSAVE committed without the
+        // matching Recommendation undo event: a retry would otherwise find no
+        // association and could never repair the stale exact signal.
+        await using var transaction = await BeginTransactionAsync(cancellationToken);
+        try
         {
+            var changed = await _associationService.DeleteOneAssociationAsync(
+                userId,
+                associationType,
+                targetId,
+                cancellationToken);
+            if (!changed)
+            {
+                if (transaction is not null)
+                {
+                    await transaction.CommitAsync(cancellationToken);
+                }
+
+                return false;
+            }
+
             await QueueRecommendationInteractionIfContentAsync(
                 userId,
                 targetId,
-                RecommendationInteractionAction.Unsave,
+                recommendationAction,
                 cancellationToken);
-        }
+            if (transaction is not null)
+            {
+                await transaction.CommitAsync(cancellationToken);
+            }
 
-        return result;
+            return true;
+        }
+        catch
+        {
+            if (transaction is not null)
+            {
+                await transaction.RollbackAsync(CancellationToken.None);
+            }
+
+            throw;
+        }
     }
 
     public async Task<bool> WatchAsync(long userId, long targetId, CancellationToken cancellationToken = default)

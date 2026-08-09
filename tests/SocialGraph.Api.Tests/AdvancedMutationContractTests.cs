@@ -37,7 +37,9 @@ public sealed class AdvancedMutationContractTests
         external.Setup(item => item.RecordRecommendationImpressionsAsync(
                 viewerId,
                 It.Is<IReadOnlyList<RecommendationImpressionEventItem>>(items =>
-                    items.Count == 1 && items[0].TargetId == snowflakeId),
+                    items.Count == 1 && items[0].TargetId == snowflakeId &&
+                    items[0].ContentKind == "POST" && items[0].QualityTier == "FAST_SKIP" &&
+                    items[0].IsOwnContent == true),
                 It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         var trusted = new Mock<ITrustedCallerAccessor>(MockBehavior.Strict);
@@ -89,6 +91,9 @@ public sealed class AdvancedMutationContractTests
 
         Assert.Empty(result.ExpectOperationResult().Errors);
         Assert.Contains("targetId: ID!", executor.Schema.ToString());
+        Assert.DoesNotContain("contentKind", executor.Schema.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("qualityTier", executor.Schema.ToString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("isOwnContent", executor.Schema.ToString(), StringComparison.OrdinalIgnoreCase);
         content.VerifyAll();
         external.VerifyAll();
         trusted.VerifyAll();
@@ -113,14 +118,16 @@ public sealed class AdvancedMutationContractTests
                     "visible",
                     0,
                     "2026-08-09T00:00:00Z",
-                    new PostAuthorResult(viewerId, "Viewer", "", false, false),
+                    new PostAuthorResult(viewerId + 1, "Author", "", false, false),
                     [])
             });
         var external = new Mock<IExternalServiceClient>(MockBehavior.Strict);
         external.Setup(item => item.RecordRecommendationImpressionsAsync(
                 viewerId,
                 It.Is<IReadOnlyList<RecommendationImpressionEventItem>>(items =>
-                    items.Count == 1 && items[0].TargetId == visibleId && items[0].IdempotencyKey == "browser-key"),
+                    items.Count == 1 && items[0].TargetId == visibleId &&
+                    items[0].IdempotencyKey == "browser-key" && items[0].ContentKind == "POST" &&
+                    items[0].QualityTier == "SHORT" && items[0].IsOwnContent == false),
                 It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         var trusted = new Mock<ITrustedCallerAccessor>(MockBehavior.Strict);
@@ -132,6 +139,112 @@ public sealed class AdvancedMutationContractTests
                     new RecommendationImpressionItemInput(visibleId.ToString(), "browser-key", 1_000, 50),
                     new RecommendationImpressionItemInput(hiddenId.ToString(), "hidden-key", 1_000, 50)
                 ]),
+            content.Object,
+            external.Object,
+            trusted.Object,
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        content.VerifyAll();
+        external.VerifyAll();
+        trusted.VerifyAll();
+    }
+
+    [Fact]
+    public async Task RecommendationImpressions_DerivesReelKindAfterVisibilityCheck()
+    {
+        const long viewerId = 100;
+        const long reelId = 202;
+        var content = new Mock<IContentGraphService>(MockBehavior.Strict);
+        content.Setup(item => item.GetPostDetailsAsync(
+                viewerId,
+                It.Is<IReadOnlyList<long>>(ids => ids.SequenceEqual(new[] { reelId })),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new IHomePostResult[]
+            {
+                new ReelDetailResult(
+                    reelId,
+                    GraphObjectType.Reel,
+                    "visible reel",
+                    0,
+                    "2026-08-09T00:00:00Z",
+                    9d / 16d,
+                    0.5d,
+                    0.5d,
+                    new PostAuthorResult(viewerId, "Viewer", "", false, false),
+                    [])
+            });
+        var external = new Mock<IExternalServiceClient>(MockBehavior.Strict);
+        external.Setup(item => item.RecordRecommendationImpressionsAsync(
+                viewerId,
+                It.Is<IReadOnlyList<RecommendationImpressionEventItem>>(items =>
+                    items.Count == 1 && items[0].TargetId == reelId &&
+                    items[0].ContentKind == "REEL" && items[0].QualityTier == "LOW" &&
+                    items[0].IsOwnContent == true),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var trusted = new Mock<ITrustedCallerAccessor>(MockBehavior.Strict);
+        trusted.Setup(item => item.RequireUserId()).Returns(viewerId);
+
+        var result = await new Mutation().RecordRecommendationImpressionsAsync(
+            new RecommendationImpressionInput(
+                // Ten minutes of real active playback on a very long Reel is not
+                // an idle signal merely because completion is still below 5%.
+                [new RecommendationImpressionItemInput(reelId.ToString(), "reel-browser-key", 600_000, 4)]),
+            content.Object,
+            external.Object,
+            trusted.Object,
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        content.VerifyAll();
+        external.VerifyAll();
+        trusted.VerifyAll();
+    }
+
+    [Fact]
+    public async Task RecommendationImpressions_DerivesVideoPostKindAndStrongerHybridTier()
+    {
+        const long viewerId = 100;
+        const long postId = 203;
+        var content = new Mock<IContentGraphService>(MockBehavior.Strict);
+        content.Setup(item => item.GetPostDetailsAsync(
+                viewerId,
+                It.Is<IReadOnlyList<long>>(ids => ids.SequenceEqual(new[] { postId })),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new IHomePostResult[]
+            {
+                new FeedPostDetailResult(
+                    postId,
+                    GraphObjectType.FeedPost,
+                    "video post",
+                    0,
+                    "2026-08-09T00:00:00Z",
+                    new PostAuthorResult(viewerId + 1, "Author", "", false, false),
+                    [],
+                    new SharedPostSourceResult(
+                        900,
+                        true,
+                        GraphObjectType.Reel,
+                        "shared video",
+                        new UserSummaryResult(viewerId + 2, "Source author", "", false),
+                        [new MediaResult(901, 1, "/media/video.mp4")]))
+            });
+        var external = new Mock<IExternalServiceClient>(MockBehavior.Strict);
+        external.Setup(item => item.RecordRecommendationImpressionsAsync(
+                viewerId,
+                It.Is<IReadOnlyList<RecommendationImpressionEventItem>>(items =>
+                    items.Count == 1 && items[0].TargetId == postId &&
+                    items[0].ContentKind == "VIDEO_POST" && items[0].QualityTier == "MID" &&
+                    items[0].IsOwnContent == false),
+                It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var trusted = new Mock<ITrustedCallerAccessor>(MockBehavior.Strict);
+        trusted.Setup(item => item.RequireUserId()).Returns(viewerId);
+
+        var result = await new Mutation().RecordRecommendationImpressionsAsync(
+            new RecommendationImpressionInput(
+                [new RecommendationImpressionItemInput(postId.ToString(), "video-post-key", 10_000, 50)]),
             content.Object,
             external.Object,
             trusted.Object,

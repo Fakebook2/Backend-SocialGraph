@@ -130,9 +130,10 @@ public sealed class ExternalServiceOutboxDispatchTests
     {
         var handler = new CapturingHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
         var client = CreateClient(handler);
+        var occurredAt = DateTimeOffset.Parse("2026-08-09T02:00:00Z");
         var message = Message(
             IntegrationEventType.RecommendationInteraction,
-            JsonSerializer.Serialize(new RecommendationInteractionEvent(123, 456, "SAVE")));
+            JsonSerializer.Serialize(new RecommendationInteractionEvent(123, 456, "SAVE", occurredAt)));
 
         await client.DispatchAsync(message);
 
@@ -144,6 +145,23 @@ public sealed class ExternalServiceOutboxDispatchTests
         using var body = JsonDocument.Parse(request.Body!);
         Assert.Equal(456, body.RootElement.GetProperty("targetId").GetInt64());
         Assert.Equal("SAVE", body.RootElement.GetProperty("action").GetString());
+        Assert.Equal(occurredAt, body.RootElement.GetProperty("occurredAt").GetDateTimeOffset());
+    }
+
+    [Fact]
+    public async Task RecommendationInteractionDispatch_KeepsLegacyEventCompatible()
+    {
+        var handler = new CapturingHandler(_ => new HttpResponseMessage(HttpStatusCode.OK));
+        var client = CreateClient(handler);
+        var message = Message(
+            IntegrationEventType.RecommendationInteraction,
+            "{\"userId\":123,\"targetId\":456,\"action\":\"LIKE\"}");
+
+        await client.DispatchAsync(message);
+
+        var request = Assert.Single(handler.Requests);
+        using var body = JsonDocument.Parse(request.Body!);
+        Assert.Equal(JsonValueKind.Null, body.RootElement.GetProperty("occurredAt").ValueKind);
     }
 
     [Fact]
@@ -157,7 +175,7 @@ public sealed class ExternalServiceOutboxDispatchTests
             JsonSerializer.Serialize(new RecommendationImpressionEvent(
                 123,
                 observedAt,
-                [new RecommendationImpressionEventItem(456, "server-key", 2_000, 75)])));
+                [new RecommendationImpressionEventItem(456, "server-key", 2_000, 75, "REEL", "HIGH", true)])));
 
         await client.DispatchAsync(message);
 
@@ -172,6 +190,9 @@ public sealed class ExternalServiceOutboxDispatchTests
         Assert.Equal("server-key", item.GetProperty("idempotencyKey").GetString());
         Assert.Equal(2_000, item.GetProperty("dwellMs").GetInt32());
         Assert.Equal(75, item.GetProperty("completionPct").GetDouble());
+        Assert.Equal("REEL", item.GetProperty("contentKind").GetString());
+        Assert.Equal("HIGH", item.GetProperty("qualityTier").GetString());
+        Assert.True(item.GetProperty("isOwnContent").GetBoolean());
     }
 
     [Fact]
@@ -196,6 +217,9 @@ public sealed class ExternalServiceOutboxDispatchTests
         Assert.Equal(0, item.GetProperty("dwellMs").GetInt32());
         Assert.Equal(JsonValueKind.Number, item.GetProperty("completionPct").ValueKind);
         Assert.Equal(0d, item.GetProperty("completionPct").GetDouble());
+        Assert.Equal(JsonValueKind.Null, item.GetProperty("contentKind").ValueKind);
+        Assert.Equal(JsonValueKind.Null, item.GetProperty("qualityTier").ValueKind);
+        Assert.Equal(JsonValueKind.Null, item.GetProperty("isOwnContent").ValueKind);
     }
 
     [Fact]
